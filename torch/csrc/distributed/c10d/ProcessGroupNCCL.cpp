@@ -1826,8 +1826,10 @@ void ProcessGroupNCCL::HeartbeatMonitor::runLoop() {
       pytorch.ProcessGroupNCCL__HeartbeatMonitor__runLoop);
 
   uint64_t heartBeatCounter = 0ULL;
-  std::string errorMsg;
-  std::string exitReason;
+  // shouldDump_ and the TCPStore dump key stay set after a collective timeout.
+  // Handle that signal once so a NoHandling/CleanUpOnly process, which stays
+  // up, does not dump again on every poll. A later watchdog hang still aborts.
+  bool collectiveDumpHandled = false;
   bool checkDumpSignal = (dumpOnTimeoutOrEx_ && pg_->getUid() == 0);
   int monitorPollInterval = checkDumpSignal ? coordCheckIntervalMilSec_
                                             : heartbeatTimeoutInSec_ * 1000;
@@ -1846,273 +1848,300 @@ void ProcessGroupNCCL::HeartbeatMonitor::runLoop() {
         pg_->globalRank(), pg_->debugInfoPipeFile_, pg_->traceBufferSize_);
   }
   while (true) {
-    // This won't have any lock since this lock is only used here.
-    // Please be aware that mutex `monitorMutex_` should not be used
-    // somewhere else to avoid the deadlock.
-    std::unique_lock<std::mutex> lock(monitorMutex_);
-    if (monitorWakeUpCV_.wait_for(
-            lock, std::chrono::milliseconds(monitorPollInterval), [&] {
-              return terminateHeartbeatMonitorThread_.load();
-            })) {
-      // For the normal complete or user interception, monitorWakeUpCV_
-      // will get notified, we early return and exit heartbeatMonitor.
-      return;
-    }
-    auto currentTime = std::chrono::steady_clock::now();
-
-    // We put extra functionality in the thread for the default PG (aka,
-    // local_id_=0) because the signal is same across different PGs. We only
-    // need to run once per process to avoid duplicate things performed in too
-    // many separate threads. For example, we check a global flag on the
-    // TCPStore periodically to see if any PG on any rank observed a timeout and
-    // signaled peers to dump debugging info, and we avoid hammering the
-    // TCPStore from all PGs on the same rank.
-    if (checkDumpSignal) {
-      // There are two scenarios where monitor thread will dump on timeout:
-      // 1. The current rank is the first to observe a timeout in watchdog.
-      // (shouldDump_ was set to true by the watchdog thread).
-      // 2. Other ranks detected the timeout and signal the current rank to
-      // dump. In addition, monitor threads will dump if watchdog threads has no
-      // heartbeat or dumpPipe is not empty.
-      if (shouldDump_.load()) {
-        errorMsg = getNCCLWatchdogTimeoutErrorMsg("this local rank");
-        exitReason = "collective timeout or exception";
-        break;
+    std::string errorMsg;
+    std::string exitReason;
+    bool watchdogHang = false;
+    {
+      // This won't have any lock since this lock is only used here.
+      // Please be aware that mutex `monitorMutex_` should not be used
+      // somewhere else to avoid the deadlock.
+      std::unique_lock<std::mutex> lock(monitorMutex_);
+      if (monitorWakeUpCV_.wait_for(
+              lock, std::chrono::milliseconds(monitorPollInterval), [&] {
+                return terminateHeartbeatMonitorThread_.load();
+              })) {
+        // For the normal complete or user interception, monitorWakeUpCV_
+        // will get notified, we early return and exit heartbeatMonitor.
+        return;
       }
-      // We poll store to see if some ranks have flagged a timeout when
-      // we haven't polled for `heartbeat_timeout` seconds and there haven't
-      // any work added or removed for `watchdog_timeout` seconds.
-      if (computeDeltaMS(lastWorkListUpdateTime_, currentTime) >=
-              kWatchdogThreadSleepMillis &&
-          computeDeltaMS(lastTimePollStore, currentTime) >=
-              coordCheckIntervalMilSec_) {
-        lastTimePollStore = currentTime;
-        auto handleError = [&](const std::string& errorMessage) {
-          LOG(WARNING)
-              << pg_->logPrefix() << "TCPStore check for dump key \""
-              << kStoreDumpKey
-              << "\" failed (store unavailable, not absent key). Cannot detect "
-              << "remote dump signals. A rank exiting outside NCCL without "
-              << "broadcasting is a separate case. Error: " << errorMessage;
-          // We give up for now assuming TCPStore has been torn down.
-          return;
-        };
-        // Wrap globalStore_->check() in a try-catch block to avoid crashing if
-        // the store is not available.
-        bool checkExceptionDump = false;
-        try {
-          checkExceptionDump =
-              pg_->globalStore()->check({std::string(kStoreDumpKey)});
-        } catch (const c10::DistNetworkError& e) {
-          handleError(e.msg());
-        } catch (const std::exception& e) {
-          handleError(e.what());
-        }
+      auto currentTime = std::chrono::steady_clock::now();
 
-        if (checkExceptionDump) {
-          int timeOutRank = -1;
-          if (!shouldDump_.load()) {
-            LOG(ERROR)
-                << pg_->logPrefix()
-                << "Observed flight recorder dump signal from another rank via TCPStore.";
-          }
-          shouldDump_.store(true);
-          try {
-            auto vec = pg_->globalStore()->get(std::string(kStoreDumpKey));
-            TORCH_CHECK_WITH(
-                DistBackendError,
-                vec.size() == sizeof(int),
-                "Invalid size for the timeout rank ID");
-            std::memcpy(&timeOutRank, vec.data(), vec.size());
-          } catch (const std::exception& e) {
-            LOG(ERROR) << pg_->logPrefix()
-                       << "Failed to get timeout rank ID from TCPStore."
-                       << e.what();
-          }
-          errorMsg =
-              getNCCLWatchdogTimeoutErrorMsg(c10::str(" rank ", timeOutRank));
+      // We put extra functionality in the thread for the default PG (aka,
+      // local_id_=0) because the signal is same across different PGs. We only
+      // need to run once per process to avoid duplicate things performed in too
+      // many separate threads. For example, we check a global flag on the
+      // TCPStore periodically to see if any PG on any rank observed a timeout
+      // and signaled peers to dump debugging info, and we avoid hammering the
+      // TCPStore from all PGs on the same rank.
+      if (checkDumpSignal && !collectiveDumpHandled) {
+        // There are two scenarios where monitor thread will dump on timeout:
+        // 1. The current rank is the first to observe a timeout in watchdog.
+        // (shouldDump_ was set to true by the watchdog thread).
+        // 2. Other ranks detected the timeout and signal the current rank to
+        // dump. In addition, monitor threads will dump if watchdog threads has
+        // no heartbeat or dumpPipe is not empty.
+        if (shouldDump_.load()) {
+          errorMsg = getNCCLWatchdogTimeoutErrorMsg("this local rank");
           exitReason = "collective timeout or exception";
+        }
+        // We poll store to see if some ranks have flagged a timeout when
+        // we haven't polled for `heartbeat_timeout` seconds and there haven't
+        // any work added or removed for `watchdog_timeout` seconds.
+        else if (
+            computeDeltaMS(lastWorkListUpdateTime_, currentTime) >=
+                kWatchdogThreadSleepMillis &&
+            computeDeltaMS(lastTimePollStore, currentTime) >=
+                coordCheckIntervalMilSec_) {
+          lastTimePollStore = currentTime;
+          auto handleError = [&](const std::string& errorMessage) {
+            LOG(WARNING)
+                << pg_->logPrefix() << "TCPStore check for dump key \""
+                << kStoreDumpKey
+                << "\" failed (store unavailable, not absent key). Cannot detect "
+                << "remote dump signals. A rank exiting outside NCCL without "
+                << "broadcasting is a separate case. Error: " << errorMessage;
+            // We give up for now assuming TCPStore has been torn down.
+            return;
+          };
+          // Wrap globalStore_->check() in a try-catch block to avoid crashing
+          // if the store is not available.
+          bool checkExceptionDump = false;
+          try {
+            checkExceptionDump =
+                pg_->globalStore()->check({std::string(kStoreDumpKey)});
+          } catch (const c10::DistNetworkError& e) {
+            handleError(e.msg());
+          } catch (const std::exception& e) {
+            handleError(e.what());
+          }
+
+          if (checkExceptionDump) {
+            int timeOutRank = -1;
+            if (!shouldDump_.load()) {
+              LOG(ERROR)
+                  << pg_->logPrefix()
+                  << "Observed flight recorder dump signal from another rank via TCPStore.";
+            }
+            shouldDump_.store(true);
+            try {
+              auto vec = pg_->globalStore()->get(std::string(kStoreDumpKey));
+              TORCH_CHECK_WITH(
+                  DistBackendError,
+                  vec.size() == sizeof(int),
+                  "Invalid size for the timeout rank ID");
+              std::memcpy(&timeOutRank, vec.data(), vec.size());
+            } catch (const std::exception& e) {
+              LOG(ERROR) << pg_->logPrefix()
+                         << "Failed to get timeout rank ID from TCPStore."
+                         << e.what();
+            }
+            errorMsg = getNCCLWatchdogTimeoutErrorMsg(
+                c10::str(" rank ", timeOutRank));
+            exitReason = "collective timeout or exception";
+          }
+        }
+      }
+
+      if (exitReason.empty() &&
+          computeDeltaMS(lastTimeHeartBeatCheck, currentTime) >=
+              heartbeatTimeoutInSec_ * 1000l) {
+        // Check the heart beat of watchdog thread.
+        lastTimeHeartBeatCheck = currentTime;
+        auto heartbeat = pg_->getWatchdogHeartbt();
+        if (heartbeat != heartBeatCounter) {
+          heartBeatCounter = heartbeat;
+        } else {
+          shouldDump_.store(true);
+          // Watchdog heartbeat timeout.
+          errorMsg = c10::str(
+              pg_->logPrefix(),
+              "ProcessGroupNCCL's watchdog got stuck for ",
+              heartbeatTimeoutInSec_,
+              " seconds without making progress in monitoring enqueued collectives. ",
+              "This typically indicates a NCCL/CUDA API (e.g., CudaEventDestroy) hang blocking the watchdog, ",
+              "and could be triggered by another thread holding the GIL inside a ",
+              "CUDA api (for example, CudaEventDestroy), or other deadlock-prone behaviors.",
+              "If you suspect the watchdog is not actually stuck and a longer timeout would help, ",
+              "you can either increase the timeout (TORCH_NCCL_HEARTBEAT_TIMEOUT_SEC) to a larger value "
+              "or disable the heartbeat monitor (TORCH_NCCL_ENABLE_MONITORING=0)."
+              "If either of aforementioned helps, feel free to file an issue to PyTorch about the short timeout "
+              "or false positive abort; otherwise, please attempt to debug the hang. ");
+          exitReason = "ProcessGroupNCCL watchdog hang";
+          watchdogHang = true;
+        }
+      }
+      // process a request to dump the trace. only PG uid 0 will respond to
+      // dump requests, but this is fine since all PG's feed into the same
+      // flight recorder and dump. After dump, the training should continue.
+      if (exitReason.empty() && dumpPipe.has_value() &&
+          dumpPipe->shouldDump()) {
+        // best effort dump, not waiting for the dump here
+        bool onlyActive = getCvarBool(TORCH_INCLUDE_ONLY_ACTIVE, false);
+        LOG(INFO) << pg_->logPrefix()
+                  << "Dump signal received through pipe, triggering FR dump.";
+        futures.emplace_back(
+            std::async(std::launch::async, [this, onlyActive]() {
+              return this->pg_->dumpDebuggingInfo(true, onlyActive);
+            }));
+      }
+    }
+    if (exitReason.empty()) {
+      continue;
+    }
+    LOG(ERROR) << errorMsg;
+
+    // Dump whenever a timeout or watchdog hang asked for it. Terminating the
+    // process is a separate decision: a collective timeout follows
+    // TORCH_NCCL_ASYNC_ERROR_HANDLING, while a stuck watchdog always aborts.
+    if (checkDumpSignal && shouldDump_.load()) {
+      // Store debug info to storage if no other thread does it. (By default to
+      // local disk)
+      bool dumpStackTrace = getCvarBool(TORCH_INCLUDE_STACK_TRACE, true);
+      bool onlyActive = getCvarBool(TORCH_INCLUDE_ONLY_ACTIVE, false);
+      ::c10d::C10dLoggingData debugLog;
+      debugLog.integers["pg_id"] = static_cast<int64_t>(pg_->getUid());
+      debugLog.integers["rank"] = pg_->getRank();
+      debugLog.integers["global_rank"] = pg_->globalRank();
+      debugLog.integers["world_size"] = pg_->getSize();
+      debugLog.strings["flight_recorder_version"] = c10d::version_val_str;
+      for (int i = 0; i < 2; i++) {
+        std::future<bool> asyncDebugDump = std::async(
+            std::launch::async, [this, dumpStackTrace, onlyActive]() {
+              return this->pg_->dumpDebuggingInfo(dumpStackTrace, onlyActive);
+            });
+
+        // wait for the dump until timeout - log data
+        auto complete = pg_->waitForFutureOrTimeout(
+            asyncDebugDump,
+            std::chrono::milliseconds(waitTimeoutDumpInMilSec_),
+            "Flight recorder dump in heartbeatMonitor",
+            debugLog,
+            false);
+
+        if (complete) {
+          LOG(INFO)
+              << pg_->logPrefix()
+              << "Finished flight recorder successfully. Output can be analyzed using the fr_trace script.";
+          if (i > 0) {
+            debugLog.strings["exception_msg"] = "Dump with stack trace failed.";
+          }
           break;
         }
+        // If we failed to dump, try dumping without stack trace in the 2nd
+        // iteration.
+        dumpStackTrace = false;
+        futures.emplace_back(std::move(asyncDebugDump));
+      }
+      debugLog.integers["trace_enabled"] = int64_t(dumpStackTrace);
+      auto logger = c10d::C10dLogger::getLogger();
+      if (logger) {
+        logger->log(debugLog);
       }
     }
 
-    if (computeDeltaMS(lastTimeHeartBeatCheck, currentTime) >=
-        heartbeatTimeoutInSec_ * 1000l) {
-      // Check the heart beat of watchdog thread.
-      lastTimeHeartBeatCheck = currentTime;
-      auto heartbeat = pg_->getWatchdogHeartbt();
-      if (heartbeat != heartBeatCounter) {
-        heartBeatCounter = heartbeat;
-      } else {
-        shouldDump_.store(true);
-        // Watchdog heartbeat timeout.
-        errorMsg = c10::str(
-            pg_->logPrefix(),
-            "ProcessGroupNCCL's watchdog got stuck for ",
-            heartbeatTimeoutInSec_,
-            " seconds without making progress in monitoring enqueued collectives. ",
-            "This typically indicates a NCCL/CUDA API (e.g., CudaEventDestroy) hang blocking the watchdog, ",
-            "and could be triggered by another thread holding the GIL inside a ",
-            "CUDA api (for example, CudaEventDestroy), or other deadlock-prone behaviors.",
-            "If you suspect the watchdog is not actually stuck and a longer timeout would help, ",
-            "you can either increase the timeout (TORCH_NCCL_HEARTBEAT_TIMEOUT_SEC) to a larger value "
-            "or disable the heartbeat monitor (TORCH_NCCL_ENABLE_MONITORING=0)."
-            "If either of aforementioned helps, feel free to file an issue to PyTorch about the short timeout "
-            "or false positive abort; otherwise, please attempt to debug the hang. ");
-        exitReason = "ProcessGroupNCCL watchdog hang";
-        break;
-      }
-    }
-    // process a request to dump the trace. only PG uid 0 will respond to dump
-    // requests, but this is fine since all PG's feed into the same flight
-    // recorder and dump. After dump, the training should continue.
-    if (dumpPipe.has_value() && dumpPipe->shouldDump()) {
-      // best effort dump, not waiting for the dump here
-      bool onlyActive = getCvarBool(TORCH_INCLUDE_ONLY_ACTIVE, false);
+    // NoHandling and CleanUpOnly record the timeout and leave the process up
+    // so the caller can read getError(). Do not require the local error_ to
+    // be set: a peer can be asked to dump before its own watchdog has failed.
+    // A stuck watchdog has nobody left to report that error, so it still
+    // aborts. TEARDOWN_ON_TIMEOUT is not consulted here; while it is off the
+    // monitor remains the backstop that kills TearDown/SkipCleanUp jobs whose
+    // watchdog swallowed the timeout.
+    const bool tearDown =
+        watchdogHang || SHOULD_TEAR_DOWN(pg_->asyncErrorHandling_);
+    if (!tearDown) {
       LOG(INFO) << pg_->logPrefix()
-                << "Dump signal received through pipe, triggering FR dump.";
-      futures.emplace_back(std::async(std::launch::async, [this, onlyActive]() {
-        return this->pg_->dumpDebuggingInfo(true, onlyActive);
-      }));
+                << "Leaving the process up after flight recorder dump because "
+                << "TORCH_NCCL_ASYNC_ERROR_HANDLING="
+                << static_cast<int>(pg_->asyncErrorHandling_)
+                << " does not tear down on collective timeout. "
+                << "The heartbeat monitor keeps running.";
+      collectiveDumpHandled = true;
+      continue;
     }
-  }
-  LOG(ERROR) << errorMsg;
 
-  // We perform some checks to help users debug the timeout/hang issue:
-  // 1. Dump the nccl trace (flight recorder) to help debug the issue
-  //    (timeout after waitTimeoutDumpInMilSec_, which is one minute).
-  // 2. Check if there is a GIL deadlock (timeout after 300ms).
-  // 3. Try to dump the c++ stacktraces (blocking and would hang,
-  //    users can turn this off by set
-  //    TORCH_NCCL_LOG_CPP_STACK_ON_UNCLEAN_SHUTDOWN=0).
-
-  // Dump the nccl trace (flight recorder).
-  if (checkDumpSignal && shouldDump_.load()) {
-    // Store debug info to storage if no other thread does it. (By default to
-    // local disk)
-    bool dumpStackTrace = getCvarBool(TORCH_INCLUDE_STACK_TRACE, true);
-    bool onlyActive = getCvarBool(TORCH_INCLUDE_ONLY_ACTIVE, false);
-    ::c10d::C10dLoggingData debugLog;
-    debugLog.integers["pg_id"] = static_cast<int64_t>(pg_->getUid());
-    debugLog.integers["rank"] = pg_->getRank();
-    debugLog.integers["global_rank"] = pg_->globalRank();
-    debugLog.integers["world_size"] = pg_->getSize();
-    debugLog.strings["flight_recorder_version"] = c10d::version_val_str;
-    for (int i = 0; i < 2; i++) {
-      std::future<bool> asyncDebugDump =
-          std::async(std::launch::async, [this, dumpStackTrace, onlyActive]() {
-            return this->pg_->dumpDebuggingInfo(dumpStackTrace, onlyActive);
-          });
-
-      // wait for the dump until timeout - log data
-      auto complete = pg_->waitForFutureOrTimeout(
-          asyncDebugDump,
-          std::chrono::milliseconds(waitTimeoutDumpInMilSec_),
-          "Flight recorder dump in heartbeatMonitor",
-          debugLog,
-          false);
-
-      if (complete) {
-        LOG(INFO)
+    // GIL deadlock check. Only on the way out: the stack dump below can block,
+    // and a process that is staying up still needs this thread to watch the
+    // watchdog.
+    if (get_gil_checker() != nullptr) {
+      auto fut = launchAsyncGilCheck();
+      auto kGilCheckTimeout = std::chrono::milliseconds(300);
+      auto futStatus = fut.wait_for(kGilCheckTimeout);
+      if (futStatus != std::future_status::ready) {
+        TORCH_CHECK(
+            futStatus != std::future_status::deferred,
+            "Expected the future to have been launched eagerly.");
+        LOG(ERROR)
             << pg_->logPrefix()
-            << "Finished flight recorder successfully. Output can be analyzed using the fr_trace script.";
-        if (i > 0) {
-          debugLog.strings["exception_msg"] = "Dump with stack trace failed.";
-        }
-        break;
+            << "Could not acquire GIL within 300 ms on exit, possible GIL induced hang";
       }
-      // If we failed to dump, try dumping without stack trace in the 2nd
-      // iteration.
-      dumpStackTrace = false;
-      futures.emplace_back(std::move(asyncDebugDump));
-    }
-    debugLog.integers["trace_enabled"] = int64_t(dumpStackTrace);
-    auto logger = c10d::C10dLogger::getLogger();
-    if (logger) {
-      logger->log(debugLog);
-    }
-  }
-
-  // GIL deadlock check.
-  if (get_gil_checker() != nullptr) {
-    auto fut = launchAsyncGilCheck();
-    auto kGilCheckTimeout = std::chrono::milliseconds(300);
-    auto futStatus = fut.wait_for(kGilCheckTimeout);
-    if (futStatus != std::future_status::ready) {
-      TORCH_CHECK(
-          futStatus != std::future_status::deferred,
-          "Expected the future to have been launched eagerly.");
-      LOG(ERROR)
-          << pg_->logPrefix()
-          << "Could not acquire GIL within 300 ms on exit, possible GIL induced hang";
-    }
-  } else {
-    VLOG(2)
-        << pg_->logPrefix()
-        << "GIL checker was not registered, perhaps this is a no-python build?";
-  }
-
-  // Dump the c++ stacktraces.
-  auto& cpp_dumper = get_cpp_trace_dumper();
-  if (logCppStackOnUncleanShutdown_ && cpp_dumper.has_value()) {
-    LOG(INFO) << pg_->logPrefix() << "Dumping c++ stacktraces:";
-    cpp_dumper.value()([&](const std::string& line) {
-      LOG(INFO) << pg_->logPrefix() << line;
-    });
-    LOG(INFO) << pg_->logPrefix() << "Finished c++ stacktraces dump.";
-  }
-
-  // There are two possible cases for the watchdog thread exit:
-  // Case one: desync report runs quickly, and it follows the step:
-  // collective timeout -> desync -> exception handling -> throwing exception.
-  // The program will exit because of exception thrown and the code below will
-  // not be run.
-  //
-  // Case two: desync might be slow or get stuck and we need to wait
-  // extra time to avoid we kill the program too early.
-  //
-  // Or we get stuck in destructors, we will sleep for some time before calling
-  // std::abort() to kill the whole process.
-  if (pg_->terminateProcessGroup_.load() || shouldDump_.load()) {
-    for (int t = 0; t < heartbeatTimeoutInSec_; ++t) {
-      if (terminateHeartbeatMonitorThread_.load()) {
-        if (t > 0)
-          LOG(INFO)
-              << pg_->logPrefix() << "slept for " << t
-              << " seconds because we want to wait longer to verify there is indeed a watchdog hang.";
-        break;
-      }
-      std::this_thread::sleep_for(std::chrono::seconds(1));
-    }
-  }
-
-  // At this point, we either already sleep for another `heartbeatTimeoutInSec_`
-  // or the thread has finished. Because we don't want to block the monitor
-  // thread, so We mark the thread detach and the dump of debug info becomes
-  // "best effort". If the process exit normally, marking it detach also makes
-  // sense because we don't really care about dumping the debug info.
-
-  // We already log completion inside the thread, so it may not be necessary to
-  // check the return value here.  We mainly use a future so we can exit early
-  // if done.
-  if (!terminateHeartbeatMonitorThread_.load()) {
-    // Create an error message reported from MonitorThread, so
-    // we throw exception and make the whole process to be killed.
-    // TODO(fduwjj): After having a hang debug wiki, we need to update the wiki
-    // url here.
-    if (watchdogHeartbeatMonitorEnabled_) {
-      pg_->terminateProcess(getNCCLWatchdogTimeoutExitMsg(exitReason));
     } else {
-      // Ideally we want to merge this one with the above one, but we are going
-      // to remove the kill switch for monitor thread soon, so we keep this one
-      // for now.
-      LOG(ERROR)
-          << pg_->logPrefix()
-          << "ProcessGroupNCCL monitor thread is disabled, but would have terminated the process"
-          << "after attempting to dump debug info, due to " << exitReason
-          << '.';
+      VLOG(2) << pg_->logPrefix()
+              << "GIL checker was not registered, perhaps this is a no-python build?";
     }
+
+    // Dump the c++ stacktraces.
+    auto& cpp_dumper = get_cpp_trace_dumper();
+    if (logCppStackOnUncleanShutdown_ && cpp_dumper.has_value()) {
+      LOG(INFO) << pg_->logPrefix() << "Dumping c++ stacktraces:";
+      cpp_dumper.value()([&](const std::string& line) {
+        LOG(INFO) << pg_->logPrefix() << line;
+      });
+      LOG(INFO) << pg_->logPrefix() << "Finished c++ stacktraces dump.";
+    }
+
+    // There are two possible cases for the watchdog thread exit:
+    // Case one: desync report runs quickly, and it follows the step:
+    // collective timeout -> desync -> exception handling -> throwing exception.
+    // The program will exit because of exception thrown and the code below
+    // will not be run.
+    //
+    // Case two: desync might be slow or get stuck and we need to wait
+    // extra time to avoid we kill the program too early.
+    //
+    // Or we get stuck in destructors, we will sleep for some time before
+    // calling std::abort() to kill the whole process.
+    if (pg_->terminateProcessGroup_.load() || shouldDump_.load()) {
+      for (int t = 0; t < heartbeatTimeoutInSec_; ++t) {
+        if (terminateHeartbeatMonitorThread_.load()) {
+          if (t > 0)
+            LOG(INFO)
+                << pg_->logPrefix() << "slept for " << t
+                << " seconds because we want to wait longer to verify there is indeed a watchdog hang.";
+          break;
+        }
+        std::this_thread::sleep_for(std::chrono::seconds(1));
+      }
+    }
+
+    // At this point, we either already sleep for another
+    // `heartbeatTimeoutInSec_` or the thread has finished. Because we don't
+    // want to block the monitor thread, so We mark the thread detach and the
+    // dump of debug info becomes "best effort". If the process exit normally,
+    // marking it detach also makes sense because we don't really care about
+    // dumping the debug info.
+
+    // We already log completion inside the thread, so it may not be necessary
+    // to check the return value here.  We mainly use a future so we can exit
+    // early if done.
+    if (!terminateHeartbeatMonitorThread_.load()) {
+      // Create an error message reported from MonitorThread, so
+      // we throw exception and make the whole process to be killed.
+      // TODO(fduwjj): After having a hang debug wiki, we need to update the
+      // wiki url here.
+      if (watchdogHeartbeatMonitorEnabled_) {
+        pg_->terminateProcess(getNCCLWatchdogTimeoutExitMsg(exitReason));
+      } else {
+        // Ideally we want to merge this one with the above one, but we are
+        // going to remove the kill switch for monitor thread soon, so we keep
+        // this one for now.
+        LOG(ERROR)
+            << pg_->logPrefix()
+            << "ProcessGroupNCCL monitor thread is disabled, but would have terminated the process"
+            << "after attempting to dump debug info, due to " << exitReason
+            << '.';
+      }
+    }
+    return;
   }
 }
 

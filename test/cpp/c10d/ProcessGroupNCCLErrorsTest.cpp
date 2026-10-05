@@ -1,6 +1,11 @@
+#include <atomic>
 #include <chrono>
+#include <cstdlib>
 #include <filesystem>
 #include <fstream>
+#include <iostream>
+#include <mutex>
+#include <string>
 #include <thread>
 
 #include <c10/util/irange.h>
@@ -298,6 +303,14 @@ class ProcessGroupNCCLErrorsTest : public ::testing::Test {
     unsetenv(c10d::TORCH_NCCL_WAIT_TIMEOUT_DUMP_MILSEC[0].c_str());
     unsetenv(c10d::TORCH_NCCL_PROPAGATE_ERROR[0].c_str());
     unsetenv(c10d::TORCH_NCCL_TEARDOWN_ON_TIMEOUT[0].c_str());
+    unsetenv(c10d::TORCH_NCCL_HEARTBEAT_TIMEOUT_SEC[0].c_str());
+    unsetenv(c10d::TORCH_NCCL_LOG_CPP_STACK_ON_UNCLEAN_SHUTDOWN[0].c_str());
+    unsetenv(c10d::TORCH_NCCL_TRACE_BUFFER_SIZE[0].c_str());
+    unsetenv(c10d::TORCH_NCCL_COORD_CHECK_MILSEC[0].c_str());
+    unsetenv(c10d::TORCH_NCCL_DUMP_ON_TIMEOUT[0].c_str());
+    unsetenv(c10d::TORCH_NCCL_ENABLE_MONITORING[0].c_str());
+    unsetenv(c10d::TORCH_NCCL_DESYNC_DEBUG[0].c_str());
+    unsetenv(c10d::TORCH_INCLUDE_STACK_TRACE[0].c_str());
   }
 
   // Shared by the timeout teardown tests. The watchdog throws from its own
@@ -485,6 +498,137 @@ TEST_F(ProcessGroupNCCLErrorsTest, testTimeoutDoesNotTearDownWhenDisabled) {
   std::this_thread::sleep_for(std::chrono::seconds(3));
 
   EXPECT_EQ(pg.getError(), c10d::ErrorType::TIMEOUT);
+}
+
+// Post-dump sleep in the teardown path, in seconds.
+constexpr int kMonitorHeartbeatTimeoutSec = 2;
+
+// shouldDump_ is the flag broadcastDumpSignal sets. These tests set it while
+// the watchdog keeps heartbeating.
+class ProcessGroupNCCLDumpSignal : public c10d::ProcessGroupNCCL {
+ public:
+  ProcessGroupNCCLDumpSignal(
+      const c10::intrusive_ptr<c10d::Store>& store,
+      int rank,
+      int size,
+      c10::intrusive_ptr<c10d::ProcessGroupNCCL::Options> opts)
+      : ProcessGroupNCCL(store, rank, size, std::move(opts)) {}
+
+  ~ProcessGroupNCCLDumpSignal() override {
+    // Stop the monitor before ~ProcessGroupNCCL(). A monitor still handling
+    // shouldDump_ would call the real terminateProcess() during teardown.
+    shouldDump_.store(false);
+    heartbeatMonitor_->stop();
+    heartbeatMonitor_->join();
+  }
+
+  void signalCollectiveDump() {
+    shouldDump_.store(true);
+  }
+
+  uint64_t watchdogHeartbeat() const {
+    return getWatchdogHeartbt();
+  }
+};
+
+// Read by the process group and its monitor at construction. Returns false
+// when an environment variable cannot be set; callers use ASSERT_TRUE.
+bool configureMonitorExitEnv(const char* asyncErrorHandling) {
+  const std::string heartbeat = std::to_string(kMonitorHeartbeatTimeoutSec);
+  // Desync debug rewrites NoHandling to SkipCleanUp. Blocking wait skips the
+  // watchdog, which the monitor would report as a hang. Rethrow and
+  // teardown-on-timeout stay off so a watchdog exception is not the signal
+  // under test. Stack traces stay off so the dump cannot sit in symbolize.
+  return setenv(
+             c10d::TORCH_NCCL_ASYNC_ERROR_HANDLING[0].c_str(),
+             asyncErrorHandling,
+             1) == 0 &&
+      setenv(c10d::TORCH_NCCL_DESYNC_DEBUG[0].c_str(), "0", 1) == 0 &&
+      setenv(c10d::TORCH_NCCL_BLOCKING_WAIT[0].c_str(), "0", 1) == 0 &&
+      setenv(c10d::TORCH_NCCL_DUMP_ON_TIMEOUT[0].c_str(), "1", 1) == 0 &&
+      setenv(c10d::TORCH_NCCL_ENABLE_MONITORING[0].c_str(), "1", 1) == 0 &&
+      setenv(c10d::TORCH_NCCL_COORD_CHECK_MILSEC[0].c_str(), "100", 1) == 0 &&
+      setenv(
+          c10d::TORCH_NCCL_HEARTBEAT_TIMEOUT_SEC[0].c_str(),
+          heartbeat.c_str(),
+          1) == 0 &&
+      setenv(
+          c10d::TORCH_NCCL_WAIT_TIMEOUT_DUMP_MILSEC[0].c_str(), "2000", 1) ==
+      0 &&
+      setenv(
+          c10d::TORCH_NCCL_LOG_CPP_STACK_ON_UNCLEAN_SHUTDOWN[0].c_str(),
+          "0",
+          1) == 0 &&
+      setenv(c10d::TORCH_NCCL_TRACE_BUFFER_SIZE[0].c_str(), "1", 1) == 0 &&
+      setenv(c10d::TORCH_INCLUDE_STACK_TRACE[0].c_str(), "0", 1) == 0 &&
+      setenv(c10d::TORCH_NCCL_RETHROW_CUDA_ERRORS[0].c_str(), "0", 1) == 0 &&
+      setenv(c10d::TORCH_NCCL_TEARDOWN_ON_TIMEOUT[0].c_str(), "0", 1) == 0;
+}
+
+// Dump attempts are capped at 2s each, and there are two. Teardown then
+// sleeps for the heartbeat timeout. A stuck watchdog adds another such sleep.
+constexpr int kMonitorObserveSec = kMonitorHeartbeatTimeoutSec + 6;
+
+// Runs in a fresh process. Returns 0 when the process stayed up and the
+// watchdog kept heartbeating. The caller exits with that code.
+int stayUpOnCollectiveDump(c10::intrusive_ptr<c10d::Store> store) {
+  auto options = c10d::ProcessGroupNCCL::Options::create();
+  ProcessGroupNCCLDumpSignal pg(std::move(store), 0, 1, options);
+  if (pg.getUid() != 0) {
+    std::cerr << "ProcessGroupNCCL local id is not 0\n";
+    return 1;
+  }
+  const auto heartbeatAtStart = pg.watchdogHeartbeat();
+  pg.signalCollectiveDump();
+  std::this_thread::sleep_for(std::chrono::seconds(kMonitorObserveSec));
+  const auto heartbeatAtEnd = pg.watchdogHeartbeat();
+  std::this_thread::sleep_for(std::chrono::seconds(1));
+  if (!(pg.watchdogHeartbeat() > heartbeatAtEnd &&
+        heartbeatAtEnd > heartbeatAtStart)) {
+    std::cerr << "watchdog heartbeat did not advance\n";
+    return 1;
+  }
+  return 0;
+}
+
+// The monitor polls collective dump signals only on local id 0. threadsafe
+// death tests re-exec the binary, so that id starts at 0 in the child.
+// CleanUpOnly shares the stay-up predicate with NoHandling. A zero-timeout
+// allreduce is the wrong stimulus: in SkipCleanUp the watchdog throws,
+// swallows it, and exits, and the monitor then aborts for a watchdog hang.
+TEST_F(
+    ProcessGroupNCCLErrorsTest,
+    testMonitorStaysUpOnCollectiveDumpWhenNoHandling) {
+  GTEST_FLAG_SET(death_test_style, "threadsafe");
+  ASSERT_TRUE(configureMonitorExitEnv("0"));
+  // The child must reach exit 0. LOG(FATAL) from the old unconditional abort
+  // does not. The regex is the log line on the collective-dump path.
+  EXPECT_EXIT(
+      std::_Exit(stayUpOnCollectiveDump(store_)),
+      ::testing::ExitedWithCode(0),
+      "Received a dump signal due to a collective timeout");
+}
+
+TEST_F(
+    ProcessGroupNCCLErrorsTest,
+    testMonitorTerminatesOnCollectiveDumpWhenSkipCleanUp) {
+  GTEST_FLAG_SET(death_test_style, "threadsafe");
+  ASSERT_TRUE(configureMonitorExitEnv("3"));
+  // Real terminateProcess() is LOG(FATAL). A watchdog hang aborts with a
+  // different reason and does not match.
+  EXPECT_DEATH(
+      {
+        auto options = c10d::ProcessGroupNCCL::Options::create();
+        ProcessGroupNCCLDumpSignal pg(store_, 0, 1, options);
+        if (pg.getUid() != 0) {
+          std::cerr << "ProcessGroupNCCL local id is not 0\n";
+          std::_Exit(0);
+        }
+        pg.signalCollectiveDump();
+        std::this_thread::sleep_for(std::chrono::seconds(kMonitorObserveSec));
+        std::_Exit(0);
+      },
+      "due to collective timeout or exception");
 }
 
 // Function to read what we wrote to the local disk for validation.
